@@ -1,0 +1,297 @@
+import os
+import re
+import time
+from collections import Counter
+from datetime import datetime
+import pandas as pd
+import requests
+import spacy
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- 2. CONSTANTES E CONFIGURAÇÕES GLOBAIS ---
+SCOPUS_API_KEY = os.getenv("SCOPUS_API_KEY")
+SCOPUS_API_URL = "https://api.elsevier.com/content/abstract/doi/"
+MDPI_API_URL = "https://www.mdpi.com/search/json_search"
+CROSSREF_API_URL = "https://api.crossref.org/works/"
+
+INDICADORES_POSITIVOS = ['was used', 'was studied', 'was cultured', 'was grown', 'the strain', 'this organism', 'inoculated', 'employed']
+INDICADORES_NEGATIVOS = ['compared to', 'similar to', 'in contrast', 'unlike', 'previously reported for']
+
+
+# --- 3. FUNÇÕES DE BUSCA NAS APIS (COM DIAGNÓSTICO) ---
+def buscar_scopus(doi, session):
+    """Busca metadados na API do Scopus com diagnóstico de erro melhorado."""
+    headers = {"X-ELS-APIKey": SCOPUS_API_KEY, "Accept": "application/json"}
+    try:
+        response = session.get(f"{SCOPUS_API_URL}{doi}", headers=headers)
+        if response.status_code == 200:
+            return response.json(), "Scopus"
+        else:
+            print(f"  - Scopus retornou um erro. Status Code: {response.status_code}")
+            print(f"  - Resposta do servidor Scopus: {response.text}")
+            return None, None
+    except requests.exceptions.RequestException as e:
+        print(f"  - Erro de conexão com Scopus: {e}")
+    return None, None
+
+def buscar_mdpi(doi, session):
+    """Busca metadados na API do MDPI."""
+    params = {'q': doi}
+    try:
+        response = session.get(MDPI_API_URL, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('hits') and data['hits'][0].get('doi') == doi:
+                return data['hits'][0], "MDPI"
+    except requests.exceptions.RequestException as e:
+        print(f"  - Erro de conexão com MDPI: {e}")
+    return None, None
+
+def buscar_crossref(doi, session):
+    """Busca metadados na API da Crossref."""
+    try:
+        response = session.get(f"{CROSSREF_API_URL}{doi}")
+        if response.status_code == 200:
+            return response.json()['message'], "Crossref"
+    except requests.exceptions.RequestException as e:
+        print(f"  - Erro de conexão com Crossref: {e}")
+    return None, None
+
+
+# --- 4. FUNÇÕES ADAPTADORAS (NORMALIZAÇÃO DOS DADOS) ---
+def adaptador_scopus(data):
+    """Normaliza a resposta JSON do Scopus para um formato padrão."""
+    abstract_info = data.get('abstracts-retrieval-response', {})
+    coredata = abstract_info.get('coredata', {})
+    authors = abstract_info.get('authors', {}).get('author', [])
+    return {
+        'titulo': coredata.get('dc:title'),
+        'autores': "; ".join([author.get('ce:indexed-name', '') for author in authors]),
+        'ano': coredata.get('prism:coverDate', '').split('-')[0] if coredata.get('prism:coverDate') else None,
+        'periodico': coredata.get('prism:publicationName'),
+        'resumo': coredata.get('dc:description'),
+        'doi': coredata.get('prism:doi')
+    }
+
+def adaptador_mdpi(data):
+    """Normaliza a resposta JSON do MDPI para um formato padrão."""
+    return {
+        'titulo': data.get('title'), 'autores': data.get('authors', '').replace(', ', '; '),
+        'ano': str(data.get('year')), 'periodico': data.get('journal'),
+        'resumo': data.get('abstract'), 'doi': data.get('doi')
+    }
+
+def adaptador_crossref(data):
+    """Normaliza a resposta JSON da Crossref para um formato padrão."""
+    authors_list = [f"{author.get('given', '')} {author.get('family', '')}" for author in data.get('author', [])]
+    return {
+        'titulo': data.get('title', [None])[0], 'autores': "; ".join(authors_list),
+        'ano': str(data.get('created', {}).get('date-parts', [[None]])[0][0]),
+        'periodico': data.get('container-title', [None])[0],
+        'resumo': data.get('abstract'), 'doi': data.get('DOI')
+    }
+
+
+# --- 5. FUNÇÕES DE PROCESSAMENTO DE NLP (ETAPA 6) ---
+def extrair_microrganismo_principal_com_contexto(texto_resumo, texto_titulo, nlp_model):
+    """Identifica o Clostridium principal e conta todas as espécies citadas usando spaCy."""
+    texto_completo = (texto_titulo or "") + ". " + (texto_resumo or "")
+    padrao = r'\b(Clostridium|C\.)\s([a-z]+)\b'
+    ocorrencias_brutas = re.findall(padrao, texto_completo, re.IGNORECASE)
+    if not ocorrencias_brutas: return "", Counter()
+    
+    candidatos_formatados = [f"{m[0].capitalize().replace('clostridium', 'Clostridium')} {m[1].lower()}" for m in ocorrencias_brutas]
+    frequencias = Counter(candidatos_formatados)
+    candidatos_unicos = list(frequencias.keys())
+    scores = {candidato: 0 for candidato in candidatos_unicos}
+    
+    for candidato in candidatos_unicos:
+        especie_pattern = r'\b' + re.escape(candidato.split(' ')[1]) + r'\b'
+        if texto_titulo and re.search(especie_pattern, texto_titulo, re.IGNORECASE): scores[candidato] += 5
+        scores[candidato] += frequencias[candidato]
+
+    doc = nlp_model(texto_resumo or "")
+    for sent in doc.sents:
+        sent_texto = sent.text.lower()
+        for candidato in candidatos_unicos:
+            especie = candidato.split(' ')[1]
+            if re.search(r'\b' + especie + r'\b', sent_texto, re.IGNORECASE):
+                if any(indicador in sent_texto for indicador in INDICADORES_POSITIVOS): scores[candidato] += 2
+                if any(indicador in sent_texto for indicador in INDICADORES_NEGATIVOS): scores[candidato] -= 3
+    
+    if not scores: return "", frequencias
+    return max(scores, key=scores.get), frequencias
+
+def extrair_composicao_gas(texto):
+    """Extrai informações sobre a composição do gás."""
+    if not texto: return []
+    padrao_percent = r'(\d{1,3}\.?\d?)\s?%\s?(?:of\s|de\s)?(CO2|N2|CH4|CO|H2|syngas)'
+    padrao_ratio = r'(CH4|CO2|CO|H2)\s?:\s?(CH4|CO2|CO|H2)\s?\((\d{1,3}:\d{1,3})\)'
+    resultados_percent = re.findall(padrao_percent, texto, re.IGNORECASE)
+    resultados_ratio = re.findall(padrao_ratio, texto, re.IGNORECASE)
+    composicao = [f"{p[0]}% {p[1]}" for p in resultados_percent]
+    composicao.extend([f"{r[0]}:{r[1]} ({r[2]})" for r in resultados_ratio])
+    if 'syngas' in texto.lower() or 'synthesis gas' in texto.lower() or 'gás de síntese' in texto.lower():
+        composicao.append("Syngas")
+    return list(set(composicao))
+
+def extrair_meio_cultura(texto):
+    """Extrai sentenças candidatas a descrever o meio de cultura."""
+    if not texto: return []
+    padrao_sentenca = r'[^.]*?(?:medium contained|composed of|consisted of|medium composition|basal medium)[^.]*\.'
+    ocorrencias = re.findall(padrao_sentenca, texto, re.IGNORECASE)
+    return list(set([s.strip() for s in ocorrencias]))
+
+def processar_nlp_do_resumo(texto_resumo, texto_titulo, nlp_model):
+    """Orquestra a extração de NLP a partir de um resumo."""
+    microrganismo_principal, contagem_microrganismos = extrair_microrganismo_principal_com_contexto(texto_resumo, texto_titulo, nlp_model)
+    return {
+        'microrganismo_principal': microrganismo_principal or "Não extraído",
+        'contagem_todas_especies': contagem_microrganismos,
+        'composicao_gas': "; ".join(extrair_composicao_gas(texto_resumo)) or "Não extraído",
+        'meio_cultura': "; ".join(extrair_meio_cultura(texto_resumo)) or "Não extraído"
+    }
+
+
+# --- 6. FUNÇÕES DE GERAÇÃO DE SAÍDA (RELATÓRIOS) ---
+def salvar_resultados_excel(lista_resultados, caminho_script):
+    """Salva os dados extraídos em uma planilha Excel."""
+    if not lista_resultados:
+        print("\nNenhum dado para salvar na planilha.")
+        return
+    nome_arquivo = f"resultados_extracao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    caminho_completo = os.path.join(caminho_script, nome_arquivo)
+    pd.DataFrame(lista_resultados).to_excel(caminho_completo, index=False, engine='openpyxl')
+    print(f"\nPlanilha de resultados salva em: {caminho_completo}")
+
+def gerar_relatorio_final(report_data, caminho_script):
+    """Gera um arquivo de texto com o relatório de execução."""
+    tempo_total_execucao = time.time() - report_data['start_time']
+    sucessos = report_data['sucessos_metadata']
+    total_proc = report_data['total_processado']
+    
+    contagem_agregada_microrganismos = Counter()
+    for contagem in report_data['lista_de_contagens_por_artigo']:
+        contagem_agregada_microrganismos.update(contagem)
+        
+    nome_arquivo = f"relatorio_execucao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    caminho_completo = os.path.join(caminho_script, nome_arquivo)
+
+    with open(caminho_completo, "w", encoding="utf-8") as f:
+        f.write("="*60 + "\nRELATÓRIO DE EXECUÇÃO - API BEATRIZ\n" + "="*60 + "\n\n")
+        f.write(f"### MÉTRICAS GERAIS ###\n")
+        f.write(f"Tempo total de execução: {tempo_total_execucao:.2f} segundos\n")
+        f.write(f"Total de DOIs processados: {total_proc}\n")
+        f.write(f"Artigos com metadados encontrados: {sucessos} ({ (sucessos/total_proc)*100 if total_proc>0 else 0 :.2f}%)\n")
+        f.write(f"Total de falhas (não encontrados): {report_data['falhas_totais']}\n\n")
+        # ... (aqui entrariam mais detalhes do relatório se necessário)
+        
+    print(f"Relatório de execução salvo em: {caminho_completo}")
+
+
+# --- 7. FUNÇÃO PRINCIPAL (MAIN) ---
+def main():
+    """Função principal que orquestra todo o processo."""
+    print("Iniciando a API Beatriz...")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # --- CONFIGURAÇÃO DO ARQUIVO DE ENTRADA ---
+    NOME_ARQUIVO_EXCEL = "entrada_dois.xlsx"
+    NOME_DA_PLANILHA = "Selecionados Scopus" # <--- ALTERAÇÃO APLICADA AQUI
+    
+    caminho_arquivo_excel = os.path.join(script_dir, NOME_ARQUIVO_EXCEL)
+    
+    print(f"Tentando ler a planilha '{NOME_DA_PLANILHA}' do arquivo '{caminho_arquivo_excel}'")
+
+    report_data = {
+        'start_time': time.time(), 'total_processado': 0, 'sucessos_metadata': 0, 'falhas_totais': 0,
+        'extracoes_microrganismo_principal': 0, 'extracoes_gas': 0, 'extracoes_meio': 0,
+        'tempos_por_artigo': [], 'dois_nao_encontrados': [], 'contagem_fontes': Counter(),
+        'lista_de_contagens_por_artigo': []
+    }
+    
+    try:
+        df_dois = pd.read_excel(caminho_arquivo_excel, sheet_name=NOME_DA_PLANILHA)
+        print(f"Arquivo e planilha lidos com sucesso. {len(df_dois)} linhas encontradas.")
+        
+        if 'DOI' not in df_dois.columns:
+            print(f"ERRO CRÍTICO: A coluna 'DOI' não foi encontrada na planilha '{NOME_DA_PLANILHA}'.")
+            return
+            
+        lista_de_dois = df_dois['DOI'].dropna().tolist()
+        report_data['total_processado'] = len(lista_de_dois)
+        print(f"{len(lista_de_dois)} DOIs foram carregados para processamento.")
+        if not lista_de_dois:
+            print("AVISO: A lista de DOIs está vazia. Encerrando.")
+            return
+            
+    except FileNotFoundError:
+        print(f"ERRO CRÍTICO: Arquivo Excel '{caminho_arquivo_excel}' não encontrado.")
+        return
+    except ValueError as e:
+        print(f"ERRO CRÍTICO: {e}")
+        print(f"Verifique se o nome da planilha (aba) dentro do arquivo Excel é exatamente '{NOME_DA_PLANILHA}'.")
+        return
+    except Exception as e:
+        print(f"ERRO CRÍTICO ao ler o arquivo Excel: {e}")
+        return
+
+    print("Carregando modelo de linguagem spaCy...")
+    try:
+        nlp_model = spacy.load("en_core_web_sm")
+        print("Modelo spaCy carregado com sucesso.")
+    except OSError:
+        print("ERRO CRÍTICO: Modelo spaCy 'en_core_web_sm' não encontrado.")
+        print("Por favor, execute no seu terminal: python -m spacy download en_core_web_sm")
+        return
+
+    resultados_finais = []
+    print("\nIniciando o loop principal de processamento de DOIs...")
+    with requests.Session() as session:
+        for i, doi in enumerate(lista_de_dois):
+            print(f"\nProcessando DOI {i+1}/{len(lista_de_dois)}: {doi}")
+            dados_brutos, fonte = buscar_scopus(doi, session)
+            if not dados_brutos:
+                print("  - Não encontrado no Scopus. Tentando MDPI...")
+                dados_brutos, fonte = buscar_mdpi(doi, session)
+            if not dados_brutos:
+                print("  - Não encontrado no MDPI. Tentando Crossref...")
+                dados_brutos, fonte = buscar_crossref(doi, session)
+            
+            if dados_brutos:
+                print(f"  - Metadados encontrados na fonte: {fonte}")
+                report_data['sucessos_metadata'] += 1
+                report_data['contagem_fontes'][fonte] += 1
+                adaptadores = {'Scopus': adaptador_scopus, 'MDPI': adaptador_mdpi, 'Crossref': adaptador_crossref}
+                dados_padronizados = adaptadores[fonte](dados_brutos)
+                dados_nlp = processar_nlp_do_resumo(dados_padronizados.get('resumo'), dados_padronizados.get('titulo'), nlp_model)
+                resultados_finais.append({**dados_padronizados, **dados_nlp})
+                
+                # Atualização das métricas
+                if dados_nlp.get('microrganismo_principal') != "Não extraído": report_data['extracoes_microrganismo_principal'] += 1
+                if dados_nlp.get('composicao_gas') != "Não extraído": report_data['extracoes_gas'] += 1
+                if dados_nlp.get('meio_cultura') != "Não extraído": report_data['extracoes_meio'] += 1
+                if dados_nlp.get('contagem_todas_especies'): report_data['lista_de_contagens_por_artigo'].append(dados_nlp['contagem_todas_especies'])
+            else:
+                print("  - DOI não encontrado em nenhuma das fontes.")
+                report_data['falhas_totais'] += 1
+                report_data['dois_nao_encontrados'].append(doi)
+                resultados_finais.append({'doi': doi, 'titulo': 'NÃO ENCONTRADO'})
+            
+            time.sleep(1)
+
+    print("\nLoop de processamento concluído.")
+    salvar_resultados_excel(resultados_finais, script_dir)
+    gerar_relatorio_final(report_data, script_dir)
+    print("\nProcesso concluído com sucesso!")
+
+
+# --- 8. PONTO DE ENTRADA DO SCRIPT ---
+if __name__ == "__main__":
+    if not SCOPUS_API_KEY:
+        print("ERRO CRÍTICO: Chave de API do Scopus não encontrada no arquivo .env.")
+    else:
+        main()
