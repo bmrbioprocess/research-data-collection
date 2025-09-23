@@ -1,297 +1,546 @@
+# --- 1. IMPORTS AND INITIAL CONFIGURATION ---
 import os
 import re
 import time
+import logging
 from collections import Counter
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Tuple, Any
 import pandas as pd
 import requests
 import spacy
 from dotenv import load_dotenv
+import diskcache as dc
 
 load_dotenv()
 
-# --- 2. CONSTANTES E CONFIGURAÇÕES GLOBAIS ---
-SCOPUS_API_KEY = os.getenv("SCOPUS_API_KEY")
-SCOPUS_API_URL = "https://api.elsevier.com/content/abstract/doi/"
-MDPI_API_URL = "https://www.mdpi.com/search/json_search"
-CROSSREF_API_URL = "https://api.crossref.org/works/"
+# --- 2. GLOBAL CONSTANTS AND CONFIGURATIONS ---
+class Config:
+    """Global configurations and constants for English scientific article processing."""
+    SCOPUS_API_KEY = os.getenv("SCOPUS_API_KEY")
+    SCOPUS_API_URL = "https://api.elsevier.com/content/abstract/doi/"
+    MDPI_API_URL = "https://www.mdpi.com/search/json_search"
+    CROSSREF_API_URL = "https://api.crossref.org/works/"
 
-INDICADORES_POSITIVOS = ['was used', 'was studied', 'was cultured', 'was grown', 'the strain', 'this organism', 'inoculated', 'employed']
-INDICADORES_NEGATIVOS = ['compared to', 'similar to', 'in contrast', 'unlike', 'previously reported for']
+    # Performance and robustness settings
+    REQUEST_TIMEOUT = 30
+    REQUEST_DELAY = 1
+    MAX_RETRIES = 3
+    MAX_WORKERS = 3
+    CACHE_EXPIRY = 86400  # 24 hours
+
+    # Enhanced linguistic indicators for English scientific text
+    POSITIVE_INDICATORS = [
+        'was used', 'was studied', 'was cultured', 'was grown',
+        'the strain', 'this organism', 'inoculated', 'employed',
+        'selected for', 'utilized', 'investigated', 'chosen',
+        'subjected to', 'cultivated in', 'grown in', 'fermented'
+    ]
+
+    NEGATIVE_INDICATORS = [
+        'compared to', 'similar to', 'in contrast', 'unlike',
+        'previously reported for', 'as opposed to', 'different from',
+        'in comparison with', 'relative to', 'versus'
+    ]
+
+    # --- ATUALIZADO: Dicionário Completo de Produtos de Fermentação ---
+    PRODUCT_KEYWORDS_NORMALIZED = {
+        'Acetate': ['acetate', 'acetic acid'],
+        'Ethanol': ['ethanol'],
+        'Butanol': ['butanol', 'n-butanol'],
+        'Hexanol': ['hexanol', 'n-hexanol', '1-hexanol'],
+        'Butyrate': ['butyrate', 'butyric acid'],
+        'Caproate': ['caproate', 'caproic acid'],
+        '2,3-Butanediol': ['2,3-butanediol', '2,3 butanediol'],
+        'Isopropanol': ['isopropanol'],
+        'Formate': ['formate', 'formic acid'],
+        'Lactate': ['lactate', 'lactic acid'],
+        'Propionate': ['propionate'],
+        'Octanol': ['octanol'],
+        'Heptanol': ['heptanol'],
+        'Pentanol': ['pentanol'],
+        'Valerate': ['valerate']
+    }
+
+    # Nominal names for gas search
+    NOMINAL_GAS_KEYWORDS = {
+        'CO': ['carbon monoxide'],
+        'H2': ['hydrogen'],
+        'CO2': ['carbon dioxide'],
+        'CH4': ['methane']
+    }
+    
+    # Gas composition patterns for English scientific literature
+    GAS_COMPOSITION_PATTERNS = [
+        r'(\d{1,3}\.?\d?)%\s*(H2|CO2|CO|CH4|N2|O2|H₂|CO₂|CH₄|N₂|O₂)',
+        r'(?:containing|composed of|consisting of)[^.]*?(\d+%[^,.]*(?:,\s*\d+%[^,.]*)*)',
+        r'(?:ratio|proportion)\s+of\s+(\d+)\s*:\s*(\d+).*?(H2.*?CO2|CO2.*?H2|CO.*?H2)',
+        r'syngas.*?[Hh]2\s*[/:]\s*[Cc][Oo].*?[=:]\s*(\d+\.?\d*)',
+        r'gas mixture.*?(\d+:\d+.*?[Hh]2.*?[Cc][Oo])',
+    ]
+
+    # Culture medium patterns for English texts
+    CULTURE_MEDIUM_PATTERNS = [
+        r'[^.]*?(?:medium contained|composed of|consisted of|medium composition|basal medium|growth medium)[^.]*\.',
+        r'[^.]*?(?:supplemented with|added with|containing)[^.]*?(\d+\.?\d*\s*(?:g/L|mg/L|mM|%))[^.]*\.',
+        r'[^.]*?(?:culture medium|fermentation medium)[^.]*?(?:was|contained)[^.]*\.',
+        r'[^.]*?(?:nutrient medium|minimal medium|complex medium)[^.]*\.',
+    ]
 
 
-# --- 3. FUNÇÕES DE BUSCA NAS APIS (COM DIAGNÓSTICO) ---
-def buscar_scopus(doi, session):
-    """Busca metadados na API do Scopus com diagnóstico de erro melhorado."""
-    headers = {"X-ELS-APIKey": SCOPUS_API_KEY, "Accept": "application/json"}
-    try:
-        response = session.get(f"{SCOPUS_API_URL}{doi}", headers=headers)
-        if response.status_code == 200:
+# --- 3. API SEARCH STRATEGIES (STRATEGY PATTERN) ---
+class APISearchStrategy:
+    """Interface for API search strategies."""
+    def search(self, doi: str, session: requests.Session) -> Tuple[Optional[Dict], Optional[str]]:
+        raise NotImplementedError
+
+class ScopusSearchStrategy(APISearchStrategy):
+    """Search strategy for Scopus API."""
+    def search(self, doi: str, session: requests.Session) -> Tuple[Optional[Dict], Optional[str]]:
+        headers = {"X-ELS-APIKey": Config.SCOPUS_API_KEY, "Accept": "application/json"}
+        url = f"{Config.SCOPUS_API_URL}{doi}"
+        response = self._make_request(session, url, headers=headers)
+        if response and response.status_code == 200:
             return response.json(), "Scopus"
-        else:
-            print(f"  - Scopus retornou um erro. Status Code: {response.status_code}")
-            print(f"  - Resposta do servidor Scopus: {response.text}")
-            return None, None
-    except requests.exceptions.RequestException as e:
-        print(f"  - Erro de conexão com Scopus: {e}")
-    return None, None
+        elif response:
+            logging.error(f"Scopus returned an error for DOI {doi}. Status: {response.status_code} | Response: {response.text}")
+        return None, None
+    def _make_request(self, session: requests.Session, url: str, **kwargs) -> Optional[requests.Response]:
+        for attempt in range(Config.MAX_RETRIES):
+            try:
+                response = session.get(url, timeout=Config.REQUEST_TIMEOUT, **kwargs)
+                if response.status_code == 200: return response
+                elif response.status_code == 429:
+                    wait_time = 2 ** attempt
+                    logging.warning(f"Rate limit reached for {url}. Waiting {wait_time}s")
+                    time.sleep(wait_time)
+                else: return response
+            except requests.exceptions.Timeout: logging.warning(f"Timeout attempt {attempt + 1} for {url}")
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Connection error for {url}: {e}")
+                break
+            if attempt < Config.MAX_RETRIES - 1: time.sleep(2 ** attempt)
+        return None
 
-def buscar_mdpi(doi, session):
-    """Busca metadados na API do MDPI."""
-    params = {'q': doi}
-    try:
-        response = session.get(MDPI_API_URL, params=params)
-        if response.status_code == 200:
+class MDPISearchStrategy(APISearchStrategy):
+    """Search strategy for MDPI API."""
+    def search(self, doi: str, session: requests.Session) -> Tuple[Optional[Dict], Optional[str]]:
+        params = {'q': doi}
+        response = self._make_request(session, Config.MDPI_API_URL, params=params)
+        if response and response.status_code == 200:
             data = response.json()
-            if data.get('hits') and data['hits'][0].get('doi') == doi:
-                return data['hits'][0], "MDPI"
-    except requests.exceptions.RequestException as e:
-        print(f"  - Erro de conexão com MDPI: {e}")
-    return None, None
+            if data.get('hits') and data['hits'][0].get('doi') == doi: return data['hits'][0], "MDPI"
+        return None, None
+    def _make_request(self, session: requests.Session, url: str, **kwargs) -> Optional[requests.Response]:
+        try: return session.get(url, timeout=Config.REQUEST_TIMEOUT, **kwargs)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"MDPI error for {url}: {e}")
+            return None
 
-def buscar_crossref(doi, session):
-    """Busca metadados na API da Crossref."""
-    try:
-        response = session.get(f"{CROSSREF_API_URL}{doi}")
-        if response.status_code == 200:
-            return response.json()['message'], "Crossref"
-    except requests.exceptions.RequestException as e:
-        print(f"  - Erro de conexão com Crossref: {e}")
-    return None, None
-
-
-# --- 4. FUNÇÕES ADAPTADORAS (NORMALIZAÇÃO DOS DADOS) ---
-def adaptador_scopus(data):
-    """Normaliza a resposta JSON do Scopus para um formato padrão."""
-    abstract_info = data.get('abstracts-retrieval-response', {})
-    coredata = abstract_info.get('coredata', {})
-    authors = abstract_info.get('authors', {}).get('author', [])
-    return {
-        'titulo': coredata.get('dc:title'),
-        'autores': "; ".join([author.get('ce:indexed-name', '') for author in authors]),
-        'ano': coredata.get('prism:coverDate', '').split('-')[0] if coredata.get('prism:coverDate') else None,
-        'periodico': coredata.get('prism:publicationName'),
-        'resumo': coredata.get('dc:description'),
-        'doi': coredata.get('prism:doi')
-    }
-
-def adaptador_mdpi(data):
-    """Normaliza a resposta JSON do MDPI para um formato padrão."""
-    return {
-        'titulo': data.get('title'), 'autores': data.get('authors', '').replace(', ', '; '),
-        'ano': str(data.get('year')), 'periodico': data.get('journal'),
-        'resumo': data.get('abstract'), 'doi': data.get('doi')
-    }
-
-def adaptador_crossref(data):
-    """Normaliza a resposta JSON da Crossref para um formato padrão."""
-    authors_list = [f"{author.get('given', '')} {author.get('family', '')}" for author in data.get('author', [])]
-    return {
-        'titulo': data.get('title', [None])[0], 'autores': "; ".join(authors_list),
-        'ano': str(data.get('created', {}).get('date-parts', [[None]])[0][0]),
-        'periodico': data.get('container-title', [None])[0],
-        'resumo': data.get('abstract'), 'doi': data.get('DOI')
-    }
+class CrossrefSearchStrategy(APISearchStrategy):
+    """Search strategy for Crossref API."""
+    def search(self, doi: str, session: requests.Session) -> Tuple[Optional[Dict], Optional[str]]:
+        url = f"{Config.CROSSREF_API_URL}{doi}"
+        response = self._make_request(session, url)
+        if response and response.status_code == 200: return response.json()['message'], "Crossref"
+        return None, None
+    def _make_request(self, session: requests.Session, url: str) -> Optional[requests.Response]:
+        try: return session.get(url, timeout=Config.REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Crossref error for {url}: {e}")
+            return None
 
 
-# --- 5. FUNÇÕES DE PROCESSAMENTO DE NLP (ETAPA 6) ---
-def extrair_microrganismo_principal_com_contexto(texto_resumo, texto_titulo, nlp_model):
-    """Identifica o Clostridium principal e conta todas as espécies citadas usando spaCy."""
-    texto_completo = (texto_titulo or "") + ". " + (texto_resumo or "")
-    padrao = r'\b(Clostridium|C\.)\s([a-z]+)\b'
-    ocorrencias_brutas = re.findall(padrao, texto_completo, re.IGNORECASE)
-    if not ocorrencias_brutas: return "", Counter()
-    
-    candidatos_formatados = [f"{m[0].capitalize().replace('clostridium', 'Clostridium')} {m[1].lower()}" for m in ocorrencias_brutas]
-    frequencias = Counter(candidatos_formatados)
-    candidatos_unicos = list(frequencias.keys())
-    scores = {candidato: 0 for candidato in candidatos_unicos}
-    
-    for candidato in candidatos_unicos:
-        especie_pattern = r'\b' + re.escape(candidato.split(' ')[1]) + r'\b'
-        if texto_titulo and re.search(especie_pattern, texto_titulo, re.IGNORECASE): scores[candidato] += 5
-        scores[candidato] += frequencias[candidato]
-
-    doc = nlp_model(texto_resumo or "")
-    for sent in doc.sents:
-        sent_texto = sent.text.lower()
-        for candidato in candidatos_unicos:
-            especie = candidato.split(' ')[1]
-            if re.search(r'\b' + especie + r'\b', sent_texto, re.IGNORECASE):
-                if any(indicador in sent_texto for indicador in INDICADORES_POSITIVOS): scores[candidato] += 2
-                if any(indicador in sent_texto for indicador in INDICADORES_NEGATIVOS): scores[candidato] -= 3
-    
-    if not scores: return "", frequencias
-    return max(scores, key=scores.get), frequencias
-
-def extrair_composicao_gas(texto):
-    """Extrai informações sobre a composição do gás."""
-    if not texto: return []
-    padrao_percent = r'(\d{1,3}\.?\d?)\s?%\s?(?:of\s|de\s)?(CO2|N2|CH4|CO|H2|syngas)'
-    padrao_ratio = r'(CH4|CO2|CO|H2)\s?:\s?(CH4|CO2|CO|H2)\s?\((\d{1,3}:\d{1,3})\)'
-    resultados_percent = re.findall(padrao_percent, texto, re.IGNORECASE)
-    resultados_ratio = re.findall(padrao_ratio, texto, re.IGNORECASE)
-    composicao = [f"{p[0]}% {p[1]}" for p in resultados_percent]
-    composicao.extend([f"{r[0]}:{r[1]} ({r[2]})" for r in resultados_ratio])
-    if 'syngas' in texto.lower() or 'synthesis gas' in texto.lower() or 'gás de síntese' in texto.lower():
-        composicao.append("Syngas")
-    return list(set(composicao))
-
-def extrair_meio_cultura(texto):
-    """Extrai sentenças candidatas a descrever o meio de cultura."""
-    if not texto: return []
-    padrao_sentenca = r'[^.]*?(?:medium contained|composed of|consisted of|medium composition|basal medium)[^.]*\.'
-    ocorrencias = re.findall(padrao_sentenca, texto, re.IGNORECASE)
-    return list(set([s.strip() for s in ocorrencias]))
-
-def processar_nlp_do_resumo(texto_resumo, texto_titulo, nlp_model):
-    """Orquestra a extração de NLP a partir de um resumo."""
-    microrganismo_principal, contagem_microrganismos = extrair_microrganismo_principal_com_contexto(texto_resumo, texto_titulo, nlp_model)
-    return {
-        'microrganismo_principal': microrganismo_principal or "Não extraído",
-        'contagem_todas_especies': contagem_microrganismos,
-        'composicao_gas': "; ".join(extrair_composicao_gas(texto_resumo)) or "Não extraído",
-        'meio_cultura': "; ".join(extrair_meio_cultura(texto_resumo)) or "Não extraído"
-    }
+# --- 4. CACHE SYSTEM ---
+class APICache:
+    """Cache system for article metadata."""
+    def __init__(self, cache_dir: str = "./api_cache"): self.cache = dc.Cache(cache_dir)
+    def get_metadata(self, doi: str) -> Optional[Dict]: return self.cache.get(doi)
+    def set_metadata(self, doi: str, metadata: Dict, source: str):
+        self.cache.set({'metadata': metadata, 'source': source, 'timestamp': datetime.now().isoformat()}, expire=Config.CACHE_EXPIRY)
+    def close(self): self.cache.close()
 
 
-# --- 6. FUNÇÕES DE GERAÇÃO DE SAÍDA (RELATÓRIOS) ---
-def salvar_resultados_excel(lista_resultados, caminho_script):
-    """Salva os dados extraídos em uma planilha Excel."""
-    if not lista_resultados:
-        print("\nNenhum dado para salvar na planilha.")
-        return
-    nome_arquivo = f"resultados_extracao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    caminho_completo = os.path.join(caminho_script, nome_arquivo)
-    pd.DataFrame(lista_resultados).to_excel(caminho_completo, index=False, engine='openpyxl')
-    print(f"\nPlanilha de resultados salva em: {caminho_completo}")
+# --- 5. METADATA ADAPTERS ---
+class MetadataAdapter:
+    """Adapter for normalizing metadata from different sources."""
+    @staticmethod
+    def adapt_scopus(data: Dict) -> Dict:
+        abstract_info = data.get('abstracts-retrieval-response', {})
+        coredata = abstract_info.get('coredata', {})
+        authors = abstract_info.get('authors', {}).get('author', [])
+        author_keywords_list = abstract_info.get('authkeywords', {}).get('author-keyword', [])
+        if isinstance(author_keywords_list, dict): author_keywords_list = [author_keywords_list]
+        authkeywords_str = "; ".join([kw.get('$', '') for kw in author_keywords_list])
+        return {
+            'title': coredata.get('dc:title'),
+            'authors': "; ".join([author.get('ce:indexed-name', '') for author in authors]),
+            'year': coredata.get('prism:coverDate', '').split('-')[0] if coredata.get('prism:coverDate') else None,
+            'journal': coredata.get('prism:publicationName'),
+            'abstract': coredata.get('dc:description'),
+            'doi': coredata.get('prism:doi'),
+            'source': 'Scopus',
+            'citations': int(coredata.get('citedby-count', 0)),
+            'author_keywords': authkeywords_str
+        }
+    @staticmethod
+    def adapt_mdpi(data: Dict) -> Dict:
+        return {
+            'title': data.get('title'), 'authors': data.get('authors', '').replace(', ', '; '),
+            'year': str(data.get('year')) if data.get('year') else None, 'journal': data.get('journal'),
+            'abstract': data.get('abstract'), 'doi': data.get('doi'), 'source': 'MDPI'
+        }
+    @staticmethod
+    def adapt_crossref(data: Dict) -> Dict:
+        authors_list = [f"{author.get('given', '')} {author.get('family', '')}".strip() for author in data.get('author', [])]
+        abstract = data.get('abstract', '')
+        if isinstance(abstract, dict): abstract = abstract.get('value', '')
+        return {
+            'title': data.get('title', [None])[0], 'authors': "; ".join(authors_list),
+            'year': str(data.get('created', {}).get('date-parts', [[None]])[0][0]),
+            'journal': data.get('container-title', [None])[0], 'abstract': abstract,
+            'doi': data.get('DOI'), 'source': 'Crossref'
+        }
+    @staticmethod
+    def validate_metadata(metadata: Dict) -> bool: return bool(metadata.get('title') and metadata.get('doi'))
 
-def gerar_relatorio_final(report_data, caminho_script):
-    """Gera um arquivo de texto com o relatório de execução."""
-    tempo_total_execucao = time.time() - report_data['start_time']
-    sucessos = report_data['sucessos_metadata']
-    total_proc = report_data['total_processado']
-    
-    contagem_agregada_microrganismos = Counter()
-    for contagem in report_data['lista_de_contagens_por_artigo']:
-        contagem_agregada_microrganismos.update(contagem)
-        
-    nome_arquivo = f"relatorio_execucao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    caminho_completo = os.path.join(caminho_script, nome_arquivo)
 
-    with open(caminho_completo, "w", encoding="utf-8") as f:
-        f.write("="*60 + "\nRELATÓRIO DE EXECUÇÃO - API BEATRIZ\n" + "="*60 + "\n\n")
-        f.write(f"### MÉTRICAS GERAIS ###\n")
-        f.write(f"Tempo total de execução: {tempo_total_execucao:.2f} segundos\n")
-        f.write(f"Total de DOIs processados: {total_proc}\n")
-        f.write(f"Artigos com metadados encontrados: {sucessos} ({ (sucessos/total_proc)*100 if total_proc>0 else 0 :.2f}%)\n")
-        f.write(f"Total de falhas (não encontrados): {report_data['falhas_totais']}\n\n")
-        # ... (aqui entrariam mais detalhes do relatório se necessário)
-        
-    print(f"Relatório de execução salvo em: {caminho_completo}")
+# --- 6. ADVANCED NLP PROCESSING ---
+class ScientificNPLExtractor:
+    """Advanced NLP extractor for English scientific articles."""
+    def __init__(self, nlp_model):
+        self.nlp = nlp_model
+        custom_stopwords = {"study", "results", "method", "conclusion", "paper", "article", "introduction", "background"}
+        for word in custom_stopwords: self.nlp.vocab[word].is_stop = True
+
+    def extract_keywords_from_text(self, title: str, abstract: str, num_keywords: int = 10) -> List[str]:
+        """Extracts the most relevant keywords from title and abstract using NLP."""
+        if not abstract: return []
+        full_text = (title.lower() + ' ') * 3 + abstract.lower()
+        doc = self.nlp(full_text)
+        filtered_tokens = [token.lemma_ for token in doc if not token.is_stop and not token.is_punct and not token.is_space and not token.like_num]
+        word_freq = Counter(filtered_tokens)
+        return [word for word, freq in word_freq.most_common(num_keywords)]
+
+    def extract_microorganisms_advanced(self, abstract_text: str, title_text: str) -> Tuple[str, Counter]:
+        """Identify microorganisms with advanced contextual analysis."""
+        full_text = (title_text or "") + ". " + (abstract_text or "")
+        pattern = r'\b(Clostridium|C\.)\s+([a-z]+[a-z\-]*[a-z]+)\b'
+        raw_occurrences = re.findall(pattern, full_text, re.IGNORECASE)
+        if not raw_occurrences: return "", Counter()
+        formatted_candidates = [f"{'C.' if g.lower() == 'c.' else 'Clostridium'} {s.lower()}" for g, s in raw_occurrences]
+        frequencies = Counter(formatted_candidates)
+        unique_candidates = list(frequencies.keys())
+        if not unique_candidates: return "", frequencies
+        scores = self._calculate_microorganism_scores(unique_candidates, frequencies, abstract_text, title_text)
+        main_microorganism = max(scores, key=scores.get) if scores else ""
+        return main_microorganism, frequencies
+
+    def _calculate_microorganism_scores(self, candidates: List[str], freqs: Counter, abstract: str, title: str) -> Dict[str, int]:
+        scores = {candidate: 0 for candidate in candidates}
+        for candidate in candidates:
+            species = candidate.split(' ')[1] if ' ' in candidate else candidate
+            scores[candidate] += freqs[candidate]
+            if title and re.search(r'\b' + re.escape(species) + r'\b', title, re.IGNORECASE): scores[candidate] += 5
+            if abstract:
+                doc = self.nlp(abstract)
+                for sent in doc.sents:
+                    text = sent.text.lower()
+                    if re.search(r'\b' + re.escape(species) + r'\b', text, re.IGNORECASE):
+                        if any(ind in text for ind in Config.POSITIVE_INDICATORS): scores[candidate] += 3
+                        if any(ind in text for ind in Config.NEGATIVE_INDICATORS): scores[candidate] -= 2
+                        if self._is_subject_in_sentence(sent, species): scores[candidate] += 2
+                        if self._is_near_experimental_terms(sent, species): scores[candidate] += 1
+        return scores
+
+    def _is_subject_in_sentence(self, sentence, species: str) -> bool:
+        for token in sentence:
+            if token.text.lower() == species.lower() and token.dep_ in ["nsubj", "nsubjpass"]: return True
+        return False
+
+    def _is_near_experimental_terms(self, sentence, species: str) -> bool:
+        terms = ['fermentation', 'culture', 'growth', 'experiment', 'study', 'assay']
+        s_tokens = [t for t in sentence if t.text.lower() == species.lower()]
+        for st in s_tokens:
+            for t in sentence:
+                if t.text.lower() in terms and abs(t.i - st.i) <= 5: return True
+        return False
+
+    def extract_fermentation_products(self, text: str) -> List[str]:
+        """Extracts and normalizes fermentation products mentioned in the text."""
+        if not text: return []
+        found = set()
+        for name, synonyms in Config.PRODUCT_KEYWORDS_NORMALIZED.items():
+            for synonym in synonyms:
+                if re.search(r'\b' + re.escape(synonym) + r'\b', text, re.IGNORECASE):
+                    found.add(name)
+                    break
+        return sorted(list(found))
+
+    def extract_gas_composition_advanced(self, text: str) -> List[str]:
+        """Extract gas composition with scientific precision for English texts."""
+        if not text: return []
+        results, text_lower = set(), text.lower()
+        for pattern in Config.GAS_COMPOSITION_PATTERNS:
+            for match in re.finditer(pattern, text_lower, re.IGNORECASE): results.add(match.group().strip())
+        for formula, names in Config.NOMINAL_GAS_KEYWORDS.items():
+            for name in names:
+                if re.search(r'\b' + re.escape(name) + r'\b', text_lower): results.add(formula)
+        if any(ind in text_lower for ind in ['syngas', 'synthesis gas']):
+            ratio = re.search(r'[Hh]2\s*[/:]\s*[Cc][Oo].*?(\d+\.?\d*)\s*:?\s*(\d+\.?\d*)', text)
+            results.add(f"Syngas H2/CO {ratio.group(1)}:{ratio.group(2)}" if ratio else "Syngas")
+        return sorted(list(results))
+
+    def extract_culture_medium_advanced(self, text: str) -> List[str]:
+        """Extract culture medium information with expanded patterns for English."""
+        if not text: return []
+        occurrences = []
+        for pattern in Config.CULTURE_MEDIUM_PATTERNS: occurrences.extend(re.findall(pattern, text, re.IGNORECASE))
+        components = [r'glucose\s*(\d+\.?\d*\s*(?:g/L|mg/L|mM|%))', r'yeast extract\s*(\d+\.?\d*\s*(?:g/L|mg/L|%))']
+        for pattern in components:
+            for match in re.finditer(pattern, text, re.IGNORECASE): occurrences.append(match.group().strip())
+        return list(set([s.strip() for s in occurrences]))
+
+    def process_abstract_comprehensive(self, abstract_text: str, title_text: str) -> Dict:
+        """Orchestrates all NLP extractions."""
+        main_microorganism, species_count = self.extract_microorganisms_advanced(abstract_text, title_text)
+        fermentation_products = self.extract_fermentation_products(abstract_text)
+        gas_composition = self.extract_gas_composition_advanced(abstract_text)
+        culture_medium = self.extract_culture_medium_advanced(abstract_text)
+        nlp_keywords = self.extract_keywords_from_text(title_text, abstract_text)
+        return {
+            'main_microorganism': main_microorganism or "Not extracted",
+            'all_species_count': species_count,
+            'fermentation_products': "; ".join(fermentation_products) or "Not extracted",
+            'gas_composition': "; ".join(gas_composition) or "Not extracted",
+            'culture_medium': "; ".join(culture_medium) or "Not extracted",
+            'nlp_keywords': "; ".join(nlp_keywords) or "Not extracted"
+        }
 
 
-# --- 7. FUNÇÃO PRINCIPAL (MAIN) ---
+# --- 7. PROCESSING MANAGER ---
+class ScientificProcessingManager:
+    """Main manager for scientific article processing."""
+    def __init__(self, nlp_model):
+        self.setup_logging()
+        self.cache = APICache()
+        self.nlp_extractor = ScientificNPLExtractor(nlp_model)
+        self.search_strategies = [ScopusSearchStrategy(), MDPISearchStrategy(), CrossrefSearchStrategy()]
+        self.metadata_adapter = MetadataAdapter()
+        self.report_data = {
+            'start_time': time.time(), 'total_processed': 0, 'metadata_success': 0, 'total_failures': 0,
+            'main_microorganism_extractions': 0, 'gas_extractions': 0, 'medium_extractions': 0,
+            'product_extractions': 0, 'processing_times': [], 'dois_not_found': [], 'processing_errors': [],
+            'source_distribution': Counter(), 'all_species_counts': []
+        }
+    def setup_logging(self):
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[logging.FileHandler(f'API_Beatriz_{datetime.now().strftime("%Y%m%d_%H%M")}.log'), logging.StreamHandler()])
+    def fetch_metadata(self, doi: str, session: requests.Session) -> Tuple[Optional[Dict], Optional[str]]:
+        cached_data = self.cache.get_metadata(doi)
+        if cached_data:
+            logging.info(f"  - Cache hit for {doi}")
+            return cached_data['metadata'], cached_data['source']
+        for strategy in self.search_strategies:
+            raw_data, source = strategy.search(doi, session)
+            if raw_data:
+                adapters = {'Scopus': self.metadata_adapter.adapt_scopus, 'MDPI': self.metadata_adapter.adapt_mdpi, 'Crossref': self.metadata_adapter.adapt_crossref}
+                if source in adapters:
+                    metadata = adapters[source](raw_data)
+                    if self.metadata_adapter.validate_metadata(metadata):
+                        self.cache.set_metadata(doi, metadata, source)
+                        return metadata, source
+        return None, None
+    def process_single_doi(self, doi: str) -> Dict:
+        start_time = time.time()
+        with requests.Session() as session:
+            metadata, source = self.fetch_metadata(doi, session)
+            if metadata and source:
+                logging.info(f"  - Metadata found via {source}")
+                nlp_data = self.nlp_extractor.process_abstract_comprehensive(metadata.get('abstract'), metadata.get('title'))
+                result = {**metadata, **nlp_data}
+                self._update_processing_metrics(nlp_data, source)
+            else:
+                logging.warning(f"  - DOI not found: {doi}")
+                result = {'doi': doi, 'title': 'NOT FOUND'}
+                self.report_data['total_failures'] += 1
+                self.report_data['dois_not_found'].append(doi)
+        self.report_data['processing_times'].append(time.time() - start_time)
+        time.sleep(Config.REQUEST_DELAY)
+        return result
+    def _update_processing_metrics(self, nlp_data: Dict, source: str):
+        self.report_data['metadata_success'] += 1
+        self.report_data['source_distribution'][source] += 1
+        if nlp_data.get('main_microorganism') != "Not extracted": self.report_data['main_microorganism_extractions'] += 1
+        if nlp_data.get('gas_composition') != "Not extracted": self.report_data['gas_extractions'] += 1
+        if nlp_data.get('culture_medium') != "Not extracted": self.report_data['medium_extractions'] += 1
+        if nlp_data.get('fermentation_products') != "Not extracted": self.report_data['product_extractions'] += 1
+        if nlp_data.get('all_species_count'): self.report_data['all_species_counts'].append(nlp_data['all_species_count'])
+    def process_dois_parallel(self, dois_list: List[str]) -> List[Dict]:
+        results = []
+        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+            future_to_doi = {executor.submit(self.process_single_doi, doi): doi for doi in dois_list}
+            for i, future in enumerate(as_completed(future_to_doi)):
+                doi = future_to_doi[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    logging.info(f"Progress: {i+1}/{len(dois_list)} - DOI: {doi} processed.")
+                except Exception as e:
+                    logging.error(f"An unexpected error occurred while processing {doi}: {e}")
+                    self.report_data['total_failures'] += 1
+                    self.report_data['processing_errors'].append({'doi': doi, 'error': str(e)})
+                    results.append({'doi': doi, 'title': 'PROCESSING ERROR', 'error': str(e)})
+        return results
+    def validate_scientific_extractions(self, results: List[Dict]) -> List[str]:
+        issues = []
+        for result in results:
+            if result.get('title') in ['NOT FOUND', 'PROCESSING ERROR']: continue
+            year = result.get('year')
+            if year and (not str(year).isdigit() or not (1900 <= int(year) <= datetime.now().year)):
+                issues.append(f"Invalid year in {result['doi']}: {year}")
+        return issues
+
+# --- 8. REPORT GENERATOR ---
+class ScientificReportGenerator:
+    @staticmethod
+    def save_results_excel(results: List[Dict], script_path: str):
+        if not results:
+            logging.warning("No data to save.")
+            return
+        df = pd.DataFrame(results)
+        colunas_a_remover = ['index_terms', 'subject_areas', 'scopus_link']
+        df_clean = df.drop(columns=[col for col in colunas_a_remover if col in df.columns])
+        if 'all_species_count' in df_clean.columns:
+            df_clean['species_count_str'] = df_clean['all_species_count'].apply(lambda x: "; ".join([f"{k}:{v}" for k, v in x.items()]) if isinstance(x, Counter) else "")
+        filename = f"scientific_extraction_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        full_path = os.path.join(script_path, filename)
+        try:
+            df_clean.to_excel(full_path, index=False, engine='openpyxl')
+            logging.info(f"Excel file saved: {full_path}")
+        except Exception as e:
+            logging.error(f"Error saving Excel: {e}")
+
+    @staticmethod
+    def gerar_planilha_ordinatio(lista_resultados: List[Dict], script_path: str):
+        """Generates a separate Excel spreadsheet for the Ordinatio method with NLP keywords."""
+        logging.info("Generating Ordinatio spreadsheet...")
+        resultados_scopus = [res for res in lista_resultados if res.get('source') == 'Scopus' and res.get('year')]
+        if not resultados_scopus:
+            logging.warning("No data from Scopus was found. Ordinatio spreadsheet will not be generated.")
+            return
+
+        df = pd.DataFrame(resultados_scopus)
+        if 'citations' not in df.columns: df['citations'] = 0
+            
+        ANO_PESQUISA, ALPHA = datetime.now().year, 10
+        df['year'] = pd.to_numeric(df['year'], errors='coerce')
+        df['citations'] = pd.to_numeric(df['citations'], errors='coerce').fillna(0)
+        df.dropna(subset=['year'], inplace=True)
+        df['InOrdinatio'] = (df['citations'] / 1000) + (ALPHA * (10 - (ANO_PESQUISA - df['year']))) + df['citations']
+        df['Keywords'] = df['author_keywords'].where(df['author_keywords'].str.strip() != '', df['nlp_keywords'])
+        df.rename(columns={'title': 'nome', 'authors': 'autores', 'doi': 'DOI', 'year': 'ano de publicação', 'citations': 'citações'}, inplace=True)
+        ordem_colunas = ['nome', 'autores', 'DOI', 'Keywords', 'ano de publicação', 'citações', 'InOrdinatio']
+        df_final = df.reindex(columns=ordem_colunas)
+        nome_arquivo = f"Ordinatio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        caminho_completo = os.path.join(script_path, nome_arquivo)
+        try:
+            df_final.to_excel(caminho_completo, index=False, engine='openpyxl')
+            logging.info(f"Ordinatio spreadsheet saved successfully: {caminho_completo}")
+        except Exception as e:
+            logging.error(f"Failed to save Ordinatio spreadsheet: {e}")
+
+    @staticmethod
+    def generate_execution_report(report_data: Dict, script_path: str, validation_issues: List[str]):
+        """Generate detailed textual execution report in English."""
+        total_time, successes, total = time.time() - report_data['start_time'], report_data['metadata_success'], report_data['total_processed']
+        times, avg_time = report_data['processing_times'], sum(times) / len(times) if times else 0
+        aggregate_species = Counter()
+        for count in report_data['all_species_counts']: aggregate_species.update(count)
+        filename = f"scientific_execution_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        full_path = os.path.join(script_path, filename)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write("="*70 + "\nSCIENTIFIC EXTRACTION EXECUTION REPORT - API Beatriz\n" + "="*70 + "\n\n")
+            f.write("### GENERAL METRICS ###\n")
+            f.write(f"Total execution time: {total_time:.2f} seconds\n")
+            f.write(f"Average time per article: {avg_time:.2f} seconds\n")
+            f.write(f"Total DOIs scheduled for processing: {total}\n")
+            f.write(f"Articles with metadata successfully retrieved: {successes} ({(successes/total)*100 if total>0 else 0:.2f}%)\n")
+            f.write(f"Total failures (not found or processing error): {report_data['total_failures']}\n\n")
+            f.write("### SOURCE DISTRIBUTION (for successful retrievals) ###\n")
+            for source, count in report_data['source_distribution'].items(): f.write(f"- {source}: {count} articles\n")
+            f.write("\n")
+            f.write("### NLP EXTRACTION EFFECTIVENESS (on successfully retrieved articles) ###\n")
+            f.write(f"- Main microorganisms extracted: {report_data['main_microorganism_extractions']} articles\n")
+            f.write(f"- Fermentation products extracted: {report_data['product_extractions']} articles\n")
+            f.write(f"- Gas compositions extracted: {report_data['gas_extractions']} articles\n")
+            f.write(f"- Culture media sentences extracted: {report_data['medium_extractions']} articles\n\n")
+            f.write("### MOST FREQUENTLY MENTIONED MICROORGANISMS (across all articles) ###\n")
+            for org, count in aggregate_species.most_common(10): f.write(f"- {org}: {count} occurrences\n")
+            f.write("\n")
+            if validation_issues:
+                f.write("### DATA VALIDATION ISSUES DETECTED ###\n")
+                for issue in validation_issues: f.write(f"- {issue}\n")
+                f.write("\n")
+            f.write("### FAILED OR UNRESOLVED DOIs ###\n")
+            if report_data['dois_not_found']:
+                f.write("\nDOIs not found in any data source:\n")
+                for doi in report_data['dois_not_found']: f.write(f"- {doi}\n")
+            if report_data['processing_errors']:
+                f.write("\nDOIs that caused a processing error:\n")
+                for error_info in report_data['processing_errors']: f.write(f"- DOI: {error_info['doi']} | Error: {error_info['error']}\n")
+            if not report_data['dois_not_found'] and not report_data['processing_errors']: f.write("No failures were recorded.\n")
+        logging.info(f"Execution report saved: {full_path}")
+
+# --- 9. MAIN EXECUTION FUNCTION ---
 def main():
-    """Função principal que orquestra todo o processo."""
-    print("Iniciando a API Beatriz...")
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # --- CONFIGURAÇÃO DO ARQUIVO DE ENTRADA ---
-    NOME_ARQUIVO_EXCEL = "entrada_dois.xlsx"
-    NOME_DA_PLANILHA = "Selecionados Scopus" # <--- ALTERAÇÃO APLICADA AQUI
-    
-    caminho_arquivo_excel = os.path.join(script_dir, NOME_ARQUIVO_EXCEL)
-    
-    print(f"Tentando ler a planilha '{NOME_DA_PLANILHA}' do arquivo '{caminho_arquivo_excel}'")
-
-    report_data = {
-        'start_time': time.time(), 'total_processado': 0, 'sucessos_metadata': 0, 'falhas_totais': 0,
-        'extracoes_microrganismo_principal': 0, 'extracoes_gas': 0, 'extracoes_meio': 0,
-        'tempos_por_artigo': [], 'dois_nao_encontrados': [], 'contagem_fontes': Counter(),
-        'lista_de_contagens_por_artigo': []
-    }
-    
-    try:
-        df_dois = pd.read_excel(caminho_arquivo_excel, sheet_name=NOME_DA_PLANILHA)
-        print(f"Arquivo e planilha lidos com sucesso. {len(df_dois)} linhas encontradas.")
-        
-        if 'DOI' not in df_dois.columns:
-            print(f"ERRO CRÍTICO: A coluna 'DOI' não foi encontrada na planilha '{NOME_DA_PLANILHA}'.")
-            return
-            
-        lista_de_dois = df_dois['DOI'].dropna().tolist()
-        report_data['total_processado'] = len(lista_de_dois)
-        print(f"{len(lista_de_dois)} DOIs foram carregados para processamento.")
-        if not lista_de_dois:
-            print("AVISO: A lista de DOIs está vazia. Encerrando.")
-            return
-            
-    except FileNotFoundError:
-        print(f"ERRO CRÍTICO: Arquivo Excel '{caminho_arquivo_excel}' não encontrado.")
+    """Optimized main function for English scientific article processing."""
+    print("Starting API Beatriz - Scientific Extraction System...")
+    if not Config.SCOPUS_API_KEY:
+        logging.error("Scopus API key not found in .env file")
         return
-    except ValueError as e:
-        print(f"ERRO CRÍTICO: {e}")
-        print(f"Verifique se o nome da planilha (aba) dentro do arquivo Excel é exatamente '{NOME_DA_PLANILHA}'.")
-        return
-    except Exception as e:
-        print(f"ERRO CRÍTICO ao ler o arquivo Excel: {e}")
-        return
-
-    print("Carregando modelo de linguagem spaCy...")
     try:
         nlp_model = spacy.load("en_core_web_sm")
-        print("Modelo spaCy carregado com sucesso.")
     except OSError:
-        print("ERRO CRÍTICO: Modelo spaCy 'en_core_web_sm' não encontrado.")
-        print("Por favor, execute no seu terminal: python -m spacy download en_core_web_sm")
+        logging.error("spaCy English model 'en_core_web_sm' not found. Please run: python -m spacy download en_core_web_sm")
         return
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    manager = ScientificProcessingManager(nlp_model)
+    
+    try:
+        EXCEL_FILENAME = "entrada_dois.xlsx"
+        SHEET_NAME = "Selecionados Scopus"
+        file_path = os.path.join(script_dir, EXCEL_FILENAME)
+        
+        logging.info(f"Reading spreadsheet: {file_path}")
+        df_dois = pd.read_excel(file_path, sheet_name=SHEET_NAME)
+        
+        if 'DOI' not in df_dois.columns:
+            logging.error("Column 'DOI' not found in spreadsheet.")
+            return
+        
+        dois_list = df_dois['DOI'].dropna().tolist()
+        manager.report_data['total_processed'] = len(dois_list)
+        if not dois_list:
+            logging.warning("No DOIs to process.")
+            return
+        
+        logging.info(f"Starting processing of {len(dois_list)} English articles...")
+        results = manager.process_dois_parallel(dois_list)
+        validation_issues = manager.validate_scientific_extractions(results)
+        
+        ScientificReportGenerator.save_results_excel(results, script_dir)
+        ScientificReportGenerator.generate_execution_report(manager.report_data, script_dir, validation_issues)
+        ScientificReportGenerator.gerar_planilha_ordinatio(results, script_dir)
+        
+        logging.info("Scientific processing completed successfully!")
+        
+    except FileNotFoundError: logging.error(f"File not found: {file_path}")
+    except ValueError as e: logging.error(f"Spreadsheet error: {e}")
+    except Exception as e: logging.error(f"Unexpected error: {e}")
+    finally: manager.cache.close()
 
-    resultados_finais = []
-    print("\nIniciando o loop principal de processamento de DOIs...")
-    with requests.Session() as session:
-        for i, doi in enumerate(lista_de_dois):
-            print(f"\nProcessando DOI {i+1}/{len(lista_de_dois)}: {doi}")
-            dados_brutos, fonte = buscar_scopus(doi, session)
-            if not dados_brutos:
-                print("  - Não encontrado no Scopus. Tentando MDPI...")
-                dados_brutos, fonte = buscar_mdpi(doi, session)
-            if not dados_brutos:
-                print("  - Não encontrado no MDPI. Tentando Crossref...")
-                dados_brutos, fonte = buscar_crossref(doi, session)
-            
-            if dados_brutos:
-                print(f"  - Metadados encontrados na fonte: {fonte}")
-                report_data['sucessos_metadata'] += 1
-                report_data['contagem_fontes'][fonte] += 1
-                adaptadores = {'Scopus': adaptador_scopus, 'MDPI': adaptador_mdpi, 'Crossref': adaptador_crossref}
-                dados_padronizados = adaptadores[fonte](dados_brutos)
-                dados_nlp = processar_nlp_do_resumo(dados_padronizados.get('resumo'), dados_padronizados.get('titulo'), nlp_model)
-                resultados_finais.append({**dados_padronizados, **dados_nlp})
-                
-                # Atualização das métricas
-                if dados_nlp.get('microrganismo_principal') != "Não extraído": report_data['extracoes_microrganismo_principal'] += 1
-                if dados_nlp.get('composicao_gas') != "Não extraído": report_data['extracoes_gas'] += 1
-                if dados_nlp.get('meio_cultura') != "Não extraído": report_data['extracoes_meio'] += 1
-                if dados_nlp.get('contagem_todas_especies'): report_data['lista_de_contagens_por_artigo'].append(dados_nlp['contagem_todas_especies'])
-            else:
-                print("  - DOI não encontrado em nenhuma das fontes.")
-                report_data['falhas_totais'] += 1
-                report_data['dois_nao_encontrados'].append(doi)
-                resultados_finais.append({'doi': doi, 'titulo': 'NÃO ENCONTRADO'})
-            
-            time.sleep(1)
-
-    print("\nLoop de processamento concluído.")
-    salvar_resultados_excel(resultados_finais, script_dir)
-    gerar_relatorio_final(report_data, script_dir)
-    print("\nProcesso concluído com sucesso!")
-
-
-# --- 8. PONTO DE ENTRADA DO SCRIPT ---
 if __name__ == "__main__":
-    if not SCOPUS_API_KEY:
-        print("ERRO CRÍTICO: Chave de API do Scopus não encontrada no arquivo .env.")
-    else:
-        main()
+    main()
